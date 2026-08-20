@@ -66,6 +66,11 @@ public class RowPage {
         return numRows();
     }
 
+    /** The largest serialized row that could ever fit on a page, header included. */
+    public static int maxRowSize() {
+        return Page.PAGE_SIZE - HEADER_SIZE;
+    }
+
     public int getFreeSpace() {
         return Page.PAGE_SIZE - freeOffset();
     }

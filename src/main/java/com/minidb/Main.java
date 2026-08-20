@@ -4,6 +4,7 @@ import com.minidb.record.Row;
 import com.minidb.record.RowPage;
 import com.minidb.record.RowSerializer;
 import com.minidb.storage.DiskManager;
+import com.minidb.table.Table;
 import com.minidb.storage.Page;
 
 import java.io.File;
@@ -20,6 +21,8 @@ public class Main {
         stage2RowThroughDisk();
         System.out.println();
         stage3MultipleRowsPerPage();
+        System.out.println();
+        stage4MultiPageTable();
     }
 
     // Stage 1: raw page data survives a close/reopen cycle.
@@ -190,6 +193,60 @@ public class Main {
         System.out.println(okDisk
                 ? "STAGE 3b PASSED: all " + fromDisk.size() + " rows and the page header survived disk."
                 : "STAGE 3b FAILED: got " + fromDisk.size() + " rows back from disk.");
+    }
+
+    // Stage 4: rows spilling across many pages, and surviving a reopen.
+    private static void stage4MultiPageTable() throws IOException {
+        String dbPath = "stage4.db";
+        new File(dbPath).delete();
+
+        // CREATE TABLE (no parser yet - Stage 5 feeds strings into these same calls)
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        Table table = new Table(disk);
+
+        // Stage 3 fit 157 alternating rows in one page; 600 forces several spills.
+        final int rowCount = 600;
+        List<Row> expected = new ArrayList<>();
+        for (int id = 1; id <= rowCount; id++) {
+            String name = (id % 2 == 1) ? "Sagar" : "a-really-long-name-here";
+            Row row = new Row(id, name, 20 + (id % 50));
+            expected.add(row);
+            table.insert(row); // INSERT
+        }
+
+        List<Row> scanned = table.scan(); // SELECT *
+        int pages = disk.getNumPages();
+        System.out.println("Inserted " + rowCount + " rows across " + pages + " pages.");
+        System.out.println("First row: " + scanned.get(0) + ", last row: " + scanned.get(scanned.size() - 1));
+
+        boolean okMemory = sameRows(expected, scanned) && pages > 1;
+        System.out.println(okMemory
+                ? "STAGE 4a PASSED: " + scanned.size() + " rows scanned back in order, spilled over " + pages + " pages."
+                : "STAGE 4a FAILED: scanned " + scanned.size() + " rows from " + pages + " page(s).");
+
+        // A taste of the Stage 5 executor: WHERE age > 60, evaluated in Java.
+        List<Row> adults = table.scanWhere(r -> r.getAge() > 60);
+        long expectedAdults = expected.stream().filter(r -> r.getAge() > 60).count();
+        System.out.println("scanWhere(age > 60) returned " + adults.size() + " rows (expected " + expectedAdults + ").");
+
+        disk.close();
+
+        // The real proof: none of this lives in memory any more.
+        DiskManager reopened = new DiskManager();
+        reopened.open(dbPath);
+        Table reloaded = new Table(reopened);
+        List<Row> afterReopen = reloaded.scan();
+        int pagesAfter = reopened.getNumPages();
+        reopened.close();
+
+        boolean okDisk = sameRows(expected, afterReopen)
+                && pagesAfter == pages
+                && adults.size() == expectedAdults;
+
+        System.out.println(okDisk
+                ? "STAGE 4b PASSED: all " + afterReopen.size() + " rows still there after close/reopen."
+                : "STAGE 4b FAILED: got " + afterReopen.size() + " rows from " + pagesAfter + " page(s) after reopen.");
     }
 
     private static boolean sameRows(List<Row> expected, List<Row> actual) {
