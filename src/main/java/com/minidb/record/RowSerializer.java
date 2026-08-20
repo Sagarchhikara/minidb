@@ -41,4 +41,12 @@ public class RowSerializer {
     public static int sizeOf(Row row) {
         return HEADER_SIZE + row.getName().getBytes(StandardCharsets.UTF_8).length + Integer.BYTES;
     }
+
+    // How many bytes the record already sitting at `offset` occupies. Reads the
+    // nameLength exactly the way deserialize() does, so the two always agree on
+    // where the next record starts.
+    public static int recordSize(byte[] data, int offset) {
+        int nameLength = ByteBuffer.wrap(data).getInt(offset);
+        return HEADER_SIZE + nameLength + Integer.BYTES;
+    }
 }
