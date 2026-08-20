@@ -1,5 +1,7 @@
 package com.minidb;
 
+import com.minidb.index.BPlusTree;
+import com.minidb.index.Rid;
 import com.minidb.record.Row;
 import com.minidb.record.RowPage;
 import com.minidb.record.RowSerializer;
@@ -20,7 +22,9 @@ import com.minidb.storage.Page;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Random;
 
 public class Main {
     public static void main(String[] args) throws IOException {
@@ -35,6 +39,10 @@ public class Main {
         stage4MultiPageTable();
         System.out.println();
         stage5SqlParser();
+        System.out.println();
+        stage6BTreeIsolation();
+        System.out.println();
+        stage6BTreeTableIntegration();
     }
 
     // Stage 1: raw page data survives a close/reopen cycle.
@@ -171,7 +179,7 @@ public class Main {
         while (true) {
             String name = (id % 2 == 1) ? "Sagar" : "a-really-long-name-here";
             Row row = new Row(id, name, 20 + (id % 50));
-            if (!rowPage.insertRow(RowSerializer.serialize(row))) {
+            if (rowPage.insertRow(RowSerializer.serialize(row)) < 0) {
                 break; // page is full
             }
             expected.add(row);
@@ -438,5 +446,175 @@ public class Main {
                 && actual.getId() == expected.getId()
                 && actual.getName().equals(expected.getName())
                 && actual.getAge() == expected.getAge();
+    }
+
+    // Stage 6A: in-memory B+Tree in isolation (hand-built search, copy-up/push-up splits,
+    // recursive insert, invariant validation after every insert, randomized stress test).
+    private static void stage6BTreeIsolation() {
+        boolean ok = true;
+        ok &= stage6aHandBuiltTreeSearch();
+        ok &= stage6aRandomizedStressTest();
+        System.out.println(ok
+                ? "STAGE 6A PASSED: B+Tree search, splits, and invariants fully verified."
+                : "STAGE 6A FAILED: see sub-step output above.");
+    }
+
+    private static boolean stage6aHandBuiltTreeSearch() {
+        // Step 1-2: Hand-built 2-level tree
+        // Internal: keys = [20], children = [leftLeaf, rightLeaf]
+        // Left leaf: keys = [5, 10, 15], rids = [(0,5), (0,10), (0,15)]
+        // Right leaf: keys = [20, 25, 30], rids = [(0,20), (0,25), (0,30)]
+        BPlusTree tree = new BPlusTree(3);
+        BPlusTree.Internal root = new BPlusTree.Internal();
+        root.keys.add(20);
+
+        BPlusTree.Leaf leftLeaf = new BPlusTree.Leaf();
+        leftLeaf.keys.addAll(List.of(5, 10, 15));
+        leftLeaf.rids.addAll(List.of(new Rid(0, 5), new Rid(0, 10), new Rid(0, 15)));
+
+        BPlusTree.Leaf rightLeaf = new BPlusTree.Leaf();
+        rightLeaf.keys.addAll(List.of(20, 25, 30));
+        rightLeaf.rids.addAll(List.of(new Rid(0, 20), new Rid(0, 25), new Rid(0, 30)));
+
+        leftLeaf.next = rightLeaf;
+        root.children.add(leftLeaf);
+        root.children.add(rightLeaf);
+        tree.setRoot(root);
+
+        boolean searchOk = true;
+        searchOk &= new Rid(0, 5).equals(tree.search(5));
+        searchOk &= new Rid(0, 10).equals(tree.search(10));
+        searchOk &= new Rid(0, 15).equals(tree.search(15));
+        searchOk &= new Rid(0, 20).equals(tree.search(20));
+        searchOk &= new Rid(0, 25).equals(tree.search(25));
+        searchOk &= new Rid(0, 30).equals(tree.search(30));
+        searchOk &= tree.search(0) == null;
+        searchOk &= tree.search(12) == null;
+        searchOk &= tree.search(100) == null;
+
+        int h = tree.validate();
+        boolean validOk = (h == 2);
+
+        boolean ok = searchOk && validOk;
+        System.out.println(ok
+                ? "STAGE 6a.1 PASSED: search on hand-built 2-level tree works accurately."
+                : "STAGE 6a.1 FAILED: hand-built tree search mismatch.");
+        return ok;
+    }
+
+    private static boolean stage6aRandomizedStressTest() {
+        final int n = 500;
+        final int maxKeys = 3; // small order forces splits at every level
+        BPlusTree tree = new BPlusTree(maxKeys);
+
+        List<Integer> keys = new ArrayList<>();
+        for (int i = 1; i <= n; i++) {
+            keys.add(i);
+        }
+        Collections.shuffle(keys, new Random(42));
+
+        // Insert and validate after EVERY insert
+        for (int k : keys) {
+            tree.insert(k, new Rid(k / 10, k % 10));
+            tree.validate();
+        }
+
+        // Verify search for all inserted keys
+        boolean allFound = true;
+        for (int k = 1; k <= n; k++) {
+            Rid rid = tree.search(k);
+            if (rid == null || !rid.equals(new Rid(k / 10, k % 10))) {
+                allFound = false;
+                break;
+            }
+        }
+
+        // Verify missing keys
+        boolean missingOk = (tree.search(0) == null) && (tree.search(n + 1) == null) && (tree.search(-5) == null);
+
+        // Verify leaf-chain traversal equals sorted 1..n
+        List<Integer> chainKeys = tree.getAllKeysFromLeafChain();
+        List<Integer> sortedExpected = new ArrayList<>();
+        for (int i = 1; i <= n; i++) {
+            sortedExpected.add(i);
+        }
+        boolean chainOk = chainKeys.equals(sortedExpected);
+
+        int height = tree.validate();
+        boolean heightOk = height > 1 && height < 15; // balanced tree
+
+        System.out.println("Inserted " + n + " shuffled keys into tree (order " + maxKeys + "). Tree height: " + height);
+        boolean ok = allFound && missingOk && chainOk && heightOk;
+        System.out.println(ok
+                ? "STAGE 6a.2 PASSED: 500-key stress test with invariant validation after every insert."
+                : "STAGE 6a.2 FAILED: stress test invariant violation or key mismatch.");
+        return ok;
+    }
+
+    // Stage 6B: wiring B+Tree into Table, RowPage, and Executor.
+    // - RowPage returns offset on insert
+    // - Table automatically updates index on insert
+    // - Table rebuilds index on open from heap
+    // - Executor uses index for WHERE id = X
+    // - Differential test (index path vs scan path) & close/reopen test
+    private static void stage6BTreeTableIntegration() throws IOException {
+        String dbPath = "stage6.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        Table table = new Table(disk);
+        Executor executor = new Executor(table);
+
+        List<Row> expected = new ArrayList<>();
+        final int rowCount = 200;
+        for (int id = 1; id <= rowCount; id++) {
+            String name = (id % 2 == 1) ? "Sagar" : "a-really-long-name-here";
+            int age = 20 + (id % 50);
+            Row row = new Row(id, name, age);
+            expected.add(row);
+            executor.execute(Parser.parse(String.format("INSERT INTO users VALUES (%d, '%s', %d)", id, name, age)));
+        }
+
+        // Differential test: point lookups via SQL (index path) vs scanWhere (scan path)
+        boolean pointLookupsOk = true;
+        for (int id : List.of(1, 2, 50, 100, 150, 200)) {
+            List<Row> viaIndex = executor.execute(Parser.parse("SELECT * FROM users WHERE id = " + id));
+            List<Row> viaScan = table.scanWhere(r -> r.getId() == id);
+            if (viaIndex.size() != 1 || viaScan.size() != 1 || !matches(viaScan.get(0), viaIndex.get(0))) {
+                pointLookupsOk = false;
+                System.out.println("  point lookup mismatch for id=" + id);
+            }
+        }
+
+        // Non-existent ID lookup
+        List<Row> missingIndex = executor.execute(Parser.parse("SELECT * FROM users WHERE id = 999"));
+        List<Row> missingScan = table.scanWhere(r -> r.getId() == 999);
+        boolean missingOk = missingIndex.isEmpty() && missingScan.isEmpty();
+
+        // Close and reopen database: verifies derived index reconstructs cleanly from heap
+        disk.close();
+
+        DiskManager reopenedDisk = new DiskManager();
+        reopenedDisk.open(dbPath);
+        Table reopenedTable = new Table(reopenedDisk);
+        Executor reopenedExecutor = new Executor(reopenedTable);
+
+        boolean reopenLookupsOk = true;
+        for (int id : List.of(1, 42, 100, 199, 200)) {
+            List<Row> viaIndex = reopenedExecutor.execute(Parser.parse("SELECT * FROM users WHERE id = " + id));
+            List<Row> viaScan = reopenedTable.scanWhere(r -> r.getId() == id);
+            if (viaIndex.size() != 1 || viaScan.size() != 1 || !matches(viaScan.get(0), viaIndex.get(0))) {
+                reopenLookupsOk = false;
+                System.out.println("  reopen point lookup mismatch for id=" + id);
+            }
+        }
+
+        reopenedDisk.close();
+
+        boolean ok = pointLookupsOk && missingOk && reopenLookupsOk;
+        System.out.println(ok
+                ? "STAGE 6B PASSED: index-accelerated point lookups agree with scans and survive reopen."
+                : "STAGE 6B FAILED: index/scan discrepancy or reopen rebuild failure.");
     }
 }

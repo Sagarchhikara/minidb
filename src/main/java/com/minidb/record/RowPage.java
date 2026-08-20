@@ -35,19 +35,23 @@ public class RowPage {
         return new RowPage(page);
     }
 
+    public record RowWithOffset(Row row, int offset) {
+    }
+
     /**
-     * Appends a serialized row. Returns false, without touching the page, when the
-     * row will not fit — the caller decides what to do with a full page.
+     * Appends a serialized row. Returns the byte offset where the row was written,
+     * or -1 without touching the page when the row will not fit — the caller decides
+     * what to do with a full page.
      */
-    public boolean insertRow(byte[] rowBytes) {
+    public int insertRow(byte[] rowBytes) {
         int free = freeOffset();
         if (free + rowBytes.length > Page.PAGE_SIZE) {
-            return false;
+            return -1;
         }
         page.putBytes(free, rowBytes);
         page.putInt(FREE_OFF, free + rowBytes.length);
         page.putInt(NUM_ROWS_OFF, numRows() + 1);
-        return true;
+        return free;
     }
 
     public List<Row> getAllRows() {
@@ -57,6 +61,19 @@ public class RowPage {
         int n = numRows();
         for (int i = 0; i < n; i++) {
             rows.add(RowSerializer.deserialize(data, offset));
+            offset += RowSerializer.recordSize(data, offset);
+        }
+        return rows;
+    }
+
+    public List<RowWithOffset> getAllRowsWithOffsets() {
+        byte[] data = page.getData();
+        List<RowWithOffset> rows = new ArrayList<>();
+        int offset = HEADER_SIZE;
+        int n = numRows();
+        for (int i = 0; i < n; i++) {
+            Row row = RowSerializer.deserialize(data, offset);
+            rows.add(new RowWithOffset(row, offset));
             offset += RowSerializer.recordSize(data, offset);
         }
         return rows;

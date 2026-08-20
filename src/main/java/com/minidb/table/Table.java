@@ -1,5 +1,7 @@
 package com.minidb.table;
 
+import com.minidb.index.BPlusTree;
+import com.minidb.index.Rid;
 import com.minidb.record.Row;
 import com.minidb.record.RowPage;
 import com.minidb.record.RowSerializer;
@@ -14,19 +16,29 @@ import java.util.function.Predicate;
 /**
  * A single heap table: rows appended across as many pages as they need.
  *
- * The DiskManager is the whole state. Page count comes from getNumPages() and
- * row counts come from each page's own header, so there is no cached copy of
- * either to fall out of sync. A page-0 catalog would change that; it waits
- * until there are multiple tables to justify it.
+ * An in-memory B+Tree secondary index is maintained on the `id` column.
+ * Because the heap is append-only and row (pageNum, offset) locations are stable,
+ * the index is derived from the heap and rebuilt by scanning all pages upon open.
  */
 public class Table {
     private final DiskManager disk;
+    private final BPlusTree index;
 
-    public Table(DiskManager disk) {
+    public Table(DiskManager disk) throws IOException {
         this.disk = disk;
+        this.index = new BPlusTree();
+        rebuildIndex();
     }
 
-    /** Appends a row, spilling onto a new page when the last one is full. */
+    public BPlusTree getIndex() {
+        return index;
+    }
+
+    public DiskManager getDisk() {
+        return disk;
+    }
+
+    /** Appends a row, spilling onto a new page when the last one is full, and updates the index. */
     public void insert(Row row) throws IOException {
         byte[] bytes = RowSerializer.serialize(row);
 
@@ -44,17 +56,19 @@ public class Table {
         int numPages = disk.getNumPages();
 
         if (numPages == 0) {
-            appendToNewPage(bytes);
+            appendToNewPage(row.getId(), bytes);
             return;
         }
 
         int last = numPages - 1;
         Page page = disk.readPage(last);
         RowPage rowPage = RowPage.load(page); // load, not init - the header is already there
-        if (rowPage.insertRow(bytes)) {
+        int offset = rowPage.insertRow(bytes);
+        if (offset >= 0) {
             disk.writePage(page);
+            index.insert(row.getId(), new Rid(last, offset));
         } else {
-            appendToNewPage(bytes);
+            appendToNewPage(row.getId(), bytes);
         }
     }
 
@@ -82,16 +96,29 @@ public class Table {
         return matches;
     }
 
-    private void appendToNewPage(byte[] bytes) throws IOException {
+    private void appendToNewPage(int id, byte[] bytes) throws IOException {
         int pageNum = disk.allocatePage();
         Page page = disk.readPage(pageNum);
         RowPage rowPage = RowPage.init(page); // brand-new page - stamp the header
-        if (!rowPage.insertRow(bytes)) {
+        int offset = rowPage.insertRow(bytes);
+        if (offset < 0) {
             // insert() screens oversized rows already, so reaching here means the
             // page geometry itself is wrong rather than the caller's row.
             throw new IllegalStateException(
                     "Row of " + bytes.length + " bytes did not fit an empty page");
         }
         disk.writePage(page); // forget this and the rows never reach disk
+        index.insert(id, new Rid(pageNum, offset));
+    }
+
+    private void rebuildIndex() throws IOException {
+        int numPages = disk.getNumPages();
+        for (int p = 0; p < numPages; p++) {
+            Page page = disk.readPage(p);
+            RowPage rowPage = RowPage.load(page);
+            for (RowPage.RowWithOffset ro : rowPage.getAllRowsWithOffsets()) {
+                index.insert(ro.row().getId(), new Rid(p, ro.offset()));
+            }
+        }
     }
 }

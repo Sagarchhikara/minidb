@@ -1,6 +1,9 @@
 package com.minidb.sql;
 
+import com.minidb.index.Rid;
 import com.minidb.record.Row;
+import com.minidb.record.RowSerializer;
+import com.minidb.storage.Page;
 import com.minidb.table.Table;
 
 import java.io.IOException;
@@ -12,8 +15,9 @@ import java.util.function.ToIntFunction;
 /**
  * Thin tree-walk from AST to the Table calls Stage 4 already proved. Not a
  * planner - a switch on statement type that reuses insert/scan/scanWhere
- * directly. The schema (id, name, age) is hardcoded here the same way it is
- * in Row; there is nowhere else to put it until there is a catalog.
+ * directly, with an index-accelerated fast path for WHERE id = X. The schema
+ * (id, name, age) is hardcoded here the same way it is in Row; there is nowhere
+ * else to put it until there is a catalog.
  */
 public class Executor {
     private static final String TABLE_NAME = "users";
@@ -32,6 +36,18 @@ public class Executor {
         }
         if (stmt instanceof SelectStatement sel) {
             checkTable(sel.table());
+            if (sel.where() != null
+                    && sel.where().column().equalsIgnoreCase("id")
+                    && sel.where().op() == TokenType.EQ
+                    && sel.where().literal() instanceof Integer targetId) {
+                Rid rid = table.getIndex().search(targetId);
+                if (rid == null) {
+                    return List.of();
+                }
+                Page page = table.getDisk().readPage(rid.pageNum());
+                Row row = RowSerializer.deserialize(page.getData(), rid.offset());
+                return List.of(row);
+            }
             return sel.where() == null ? table.scan() : table.scanWhere(predicateFrom(sel.where()));
         }
         throw new IllegalStateException("unhandled statement type: " + stmt);
