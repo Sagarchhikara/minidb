@@ -44,9 +44,13 @@ public class Executor {
                 if (rid == null) {
                     return List.of();
                 }
-                Page page = table.getDisk().readPage(rid.pageNum());
-                Row row = RowSerializer.deserialize(page.getData(), rid.offset());
-                return List.of(row);
+                Page page = table.getBufferPool().fetchPage(rid.pageNum());
+                try {
+                    Row row = RowSerializer.deserialize(page.getData(), rid.offset());
+                    return List.of(row);
+                } finally {
+                    table.getBufferPool().unpin(rid.pageNum(), false);
+                }
             }
             return sel.where() == null ? table.scan() : table.scanWhere(predicateFrom(sel.where()));
         }

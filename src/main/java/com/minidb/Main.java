@@ -5,7 +5,10 @@ import com.minidb.index.Rid;
 import com.minidb.record.Row;
 import com.minidb.record.RowPage;
 import com.minidb.record.RowSerializer;
+import com.minidb.storage.BufferPool;
 import com.minidb.storage.DiskManager;
+import com.minidb.storage.FifoPolicy;
+import com.minidb.storage.LruPolicy;
 import com.minidb.sql.Condition;
 import com.minidb.sql.Executor;
 import com.minidb.sql.InsertStatement;
@@ -43,6 +46,8 @@ public class Main {
         stage6BTreeIsolation();
         System.out.println();
         stage6BTreeTableIntegration();
+        System.out.println();
+        stage7BufferPool();
     }
 
     // Stage 1: raw page data survives a close/reopen cycle.
@@ -250,6 +255,7 @@ public class Main {
         long expectedAdults = expected.stream().filter(r -> r.getAge() > 60).count();
         System.out.println("scanWhere(age > 60) returned " + adults.size() + " rows (expected " + expectedAdults + ").");
 
+        table.flush();
         disk.close();
 
         // The real proof: none of this lives in memory any more.
@@ -258,6 +264,7 @@ public class Main {
         Table reloaded = new Table(reopened);
         List<Row> afterReopen = reloaded.scan();
         int pagesAfter = reopened.getNumPages();
+        reloaded.flush();
         reopened.close();
 
         boolean okDisk = sameRows(expected, afterReopen)
@@ -418,6 +425,7 @@ public class Main {
                 + ", WHERE age > 60 matched " + viaSql.size() + " both ways.");
         System.out.println(Executor.project(viaSqlSelectStar.get(0), List.of("name")));
 
+        table.flush();
         disk.close();
 
         boolean ok = scanOk && whereOk && caseOk;
@@ -601,6 +609,7 @@ public class Main {
         boolean missingOk = missingIndex.isEmpty() && missingScan.isEmpty();
 
         // Close and reopen database: verifies derived index reconstructs cleanly from heap
+        table.flush();
         disk.close();
 
         DiskManager reopenedDisk = new DiskManager();
@@ -626,11 +635,257 @@ public class Main {
             }
         }
 
+        reopenedTable.flush();
         reopenedDisk.close();
 
         boolean ok = pointLookupsOk && duplicateRejected && missingOk && reopenDuplicateRejected && reopenLookupsOk;
         System.out.println(ok
                 ? "STAGE 6B PASSED: index-accelerated point lookups agree with scans, duplicates rejected, and survives reopen."
                 : "STAGE 6B FAILED: index/scan discrepancy, duplicate not rejected, or reopen rebuild failure.");
+    }
+
+    // Stage 7: Buffer pool with LRU and FIFO eviction policies.
+    private static void stage7BufferPool() throws IOException {
+        boolean ok = true;
+        ok &= stage7aHitMissAccounting();
+        ok &= stage7bDurabilityThroughEviction();
+        ok &= stage7cLruVsFifoEviction();
+        ok &= stage7dPinnedProtection();
+        ok &= stage7eTableThroughBufferPool();
+        System.out.println(ok
+                ? "STAGE 7 PASSED: Buffer pool, LRU/FIFO eviction, and pin/dirty protocol fully verified."
+                : "STAGE 7 FAILED: see sub-step output above.");
+    }
+
+    // Step 7.2: Hit/miss accounting
+    private static boolean stage7aHitMissAccounting() throws IOException {
+        String dbPath = "stage7_hits.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        for (int i = 0; i < 5; i++) {
+            disk.allocatePage();
+        }
+
+        BufferPool pool = new BufferPool(disk, 3);
+        // Fetch 0 -> Miss (1 miss, 0 hits)
+        Page p0 = pool.fetchPage(0);
+        pool.unpin(0, false);
+
+        // Fetch 0 again -> Hit (1 miss, 1 hit)
+        p0 = pool.fetchPage(0);
+        pool.unpin(0, false);
+
+        // Fetch 1 -> Miss (2 misses, 1 hit)
+        Page p1 = pool.fetchPage(1);
+        pool.unpin(1, false);
+
+        // Fetch 2 -> Miss (3 misses, 1 hit) — pool now full [0, 1, 2]
+        Page p2 = pool.fetchPage(2);
+        pool.unpin(2, false);
+
+        // Fetch 3 -> Miss (4 misses, 1 hit) — evicts 0
+        Page p3 = pool.fetchPage(3);
+        pool.unpin(3, false);
+
+        // Re-fetch 0 -> Miss (5 misses, 1 hit) — was evicted
+        p0 = pool.fetchPage(0);
+        pool.unpin(0, false);
+
+        disk.close();
+
+        boolean ok = (pool.getHits() == 1) && (pool.getMisses() == 5);
+        System.out.println(ok
+                ? "STAGE 7a PASSED: hit/miss counters and eviction accounting work accurately (1 hit, 5 misses)."
+                : "STAGE 7a FAILED: expected 1 hit, 5 misses but got " + pool.getHits() + " hits, " + pool.getMisses() + " misses.");
+        return ok;
+    }
+
+    // Step 7.3: Durability through eviction (dirty pages must be flushed before eviction)
+    private static boolean stage7bDurabilityThroughEviction() throws IOException {
+        String dbPath = "stage7_durability.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        for (int i = 0; i < 6; i++) {
+            disk.allocatePage();
+        }
+
+        // Capacity 4: write to page 0 (dirty), then fetch 4 other pages to force page 0's eviction
+        BufferPool pool = new BufferPool(disk, 4);
+        Page p0 = pool.fetchPage(0);
+        p0.putInt(0, 987654);
+        pool.unpin(0, true); // marked dirty!
+
+        for (int i = 1; i <= 4; i++) {
+            Page p = pool.fetchPage(i);
+            pool.unpin(i, false);
+        }
+
+        boolean evictedFromPool = !pool.isCached(0);
+
+        // Close the pool without calling flushAll — disk file must ALREADY have page 0 flushed via eviction!
+        disk.close();
+
+        // Reopen disk directly to verify page 0 persisted on disk
+        DiskManager reopened = new DiskManager();
+        reopened.open(dbPath);
+        Page readBack = reopened.readPage(0);
+        int val = readBack.getInt(0);
+        reopened.close();
+
+        boolean ok = evictedFromPool && (val == 987654);
+        System.out.println(ok
+                ? "STAGE 7b PASSED: dirty page flushed to disk upon eviction and survived reopen (value=" + val + ")."
+                : "STAGE 7b FAILED: dirty page data lost during eviction (read back " + val + ").");
+        return ok;
+    }
+
+    // Step 7.4: LRU vs FIFO eviction behavior
+    private static boolean stage7cLruVsFifoEviction() throws IOException {
+        String dbPath = "stage7_lru_fifo.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        for (int i = 0; i < 6; i++) {
+            disk.allocatePage();
+        }
+
+        // Access sequence: 1, 2, 3, 1, 4 with capacity 3
+        // LRU: touch on 1 moves 1 to MRU, so accessing 4 evicts 2 (least recently used)
+        BufferPool lruPool = new BufferPool(disk, 3, new LruPolicy());
+        poolAccess(lruPool, 1);
+        poolAccess(lruPool, 2);
+        poolAccess(lruPool, 3);
+        poolAccess(lruPool, 1); // touch 1
+        poolAccess(lruPool, 4); // triggers eviction of 2
+
+        boolean lruOk = !lruPool.isCached(2)
+                && lruPool.isCached(1)
+                && lruPool.isCached(3)
+                && lruPool.isCached(4);
+
+        // FIFO: ignores touch on 1, so accessing 4 evicts 1 (oldest insertion)
+        BufferPool fifoPool = new BufferPool(disk, 3, new FifoPolicy());
+        poolAccess(fifoPool, 1);
+        poolAccess(fifoPool, 2);
+        poolAccess(fifoPool, 3);
+        poolAccess(fifoPool, 1); // touch ignored by FIFO
+        poolAccess(fifoPool, 4); // triggers eviction of 1
+
+        boolean fifoOk = !fifoPool.isCached(1)
+                && fifoPool.isCached(2)
+                && fifoPool.isCached(3)
+                && fifoPool.isCached(4);
+
+        disk.close();
+
+        boolean ok = lruOk && fifoOk;
+        System.out.println(ok
+                ? "STAGE 7c PASSED: LRU evicted page 2 while FIFO evicted page 1 on pattern 1,2,3,1,4."
+                : "STAGE 7c FAILED: eviction policy divergence mismatch (lruOk=" + lruOk + ", fifoOk=" + fifoOk + ").");
+        return ok;
+    }
+
+    private static void poolAccess(BufferPool pool, int pageNum) throws IOException {
+        Page p = pool.fetchPage(pageNum);
+        pool.unpin(pageNum, false);
+    }
+
+    // Pinned frames protection during eviction
+    private static boolean stage7dPinnedProtection() throws IOException {
+        String dbPath = "stage7_pinned.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        for (int i = 0; i < 5; i++) {
+            disk.allocatePage();
+        }
+
+        BufferPool pool = new BufferPool(disk, 2);
+        Page p0 = pool.fetchPage(0); // pinCount = 1 (pinned)
+        Page p1 = pool.fetchPage(1); // pinCount = 1
+        pool.unpin(1, false);        // pinCount = 0 (unpinned)
+
+        // Fetching page 2 must evict page 1 (since page 0 is pinned)
+        Page p2 = pool.fetchPage(2);
+        boolean p0Protected = pool.isCached(0) && !pool.isCached(1) && pool.isCached(2);
+
+        // Both page 0 and page 2 are now pinned; fetching page 3 must throw
+        boolean threwWhenAllPinned = false;
+        try {
+            pool.fetchPage(3);
+        } catch (IllegalStateException e) {
+            threwWhenAllPinned = true;
+        }
+
+        pool.unpin(0, false);
+        pool.unpin(2, false);
+        disk.close();
+
+        boolean ok = p0Protected && threwWhenAllPinned;
+        System.out.println(ok
+                ? "STAGE 7d PASSED: pinned frames are protected from eviction; all-pinned throws as expected."
+                : "STAGE 7d FAILED: pinned frame protection failed.");
+        return ok;
+    }
+
+    // Step 7.1: Table routed through BufferPool with small cache (capacity 3)
+    private static boolean stage7eTableThroughBufferPool() throws IOException {
+        String dbPath = "stage7_table.db";
+        new File(dbPath).delete();
+
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        BufferPool pool = new BufferPool(disk, 3); // small pool forces constant eviction
+        Table table = new Table(pool);
+        Executor executor = new Executor(table);
+
+        List<Row> expected = new ArrayList<>();
+        final int count = 150;
+        for (int id = 1; id <= count; id++) {
+            String name = (id % 2 == 1) ? "Sagar" : "a-really-long-name-here";
+            int age = 20 + (id % 50);
+            Row row = new Row(id, name, age);
+            expected.add(row);
+            executor.execute(Parser.parse(String.format("INSERT INTO users VALUES (%d, '%s', %d)", id, name, age)));
+        }
+
+        List<Row> scanned = table.scan();
+        boolean scanOk = sameRows(expected, scanned);
+
+        // Point queries via index through buffer pool
+        boolean indexLookupsOk = true;
+        for (int id : List.of(1, 25, 75, 120, 150)) {
+            List<Row> rows = executor.execute(Parser.parse("SELECT * FROM users WHERE id = " + id));
+            if (rows.size() != 1 || rows.get(0).getId() != id) {
+                indexLookupsOk = false;
+                break;
+            }
+        }
+
+        table.flush();
+        disk.close();
+
+        // Reopen table with buffer pool and verify data survived
+        DiskManager reopenedDisk = new DiskManager();
+        reopenedDisk.open(dbPath);
+        BufferPool reopenedPool = new BufferPool(reopenedDisk, 4);
+        Table reopenedTable = new Table(reopenedPool);
+        List<Row> afterReopen = reopenedTable.scan();
+        reopenedTable.flush();
+        reopenedDisk.close();
+
+        boolean reopenOk = sameRows(expected, afterReopen);
+
+        boolean ok = scanOk && indexLookupsOk && reopenOk;
+        System.out.println(ok
+                ? "STAGE 7e PASSED: Table operates transparently through a constrained buffer pool."
+                : "STAGE 7e FAILED: table through buffer pool produced data mismatch.");
+        return ok;
     }
 }
