@@ -40,6 +40,11 @@ public class Table {
 
     /** Appends a row, spilling onto a new page when the last one is full, and updates the index. */
     public void insert(Row row) throws IOException {
+        // Enforce primary key uniqueness on id before modifying the heap
+        if (index.search(row.getId()) != null) {
+            throw new IllegalArgumentException("Duplicate key: id " + row.getId() + " already exists");
+        }
+
         byte[] bytes = RowSerializer.serialize(row);
 
         // Checked before anything touches disk. Deferring this to appendToNewPage

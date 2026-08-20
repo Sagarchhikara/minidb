@@ -587,6 +587,14 @@ public class Main {
             }
         }
 
+        // Duplicate primary key rejection test
+        boolean duplicateRejected = false;
+        try {
+            table.insert(new Row(1, "Duplicate", 99));
+        } catch (IllegalArgumentException e) {
+            duplicateRejected = true;
+        }
+
         // Non-existent ID lookup
         List<Row> missingIndex = executor.execute(Parser.parse("SELECT * FROM users WHERE id = 999"));
         List<Row> missingScan = table.scanWhere(r -> r.getId() == 999);
@@ -600,6 +608,14 @@ public class Main {
         Table reopenedTable = new Table(reopenedDisk);
         Executor reopenedExecutor = new Executor(reopenedTable);
 
+        // Duplicate primary key rejection on reopened table
+        boolean reopenDuplicateRejected = false;
+        try {
+            reopenedTable.insert(new Row(42, "Duplicate", 99));
+        } catch (IllegalArgumentException e) {
+            reopenDuplicateRejected = true;
+        }
+
         boolean reopenLookupsOk = true;
         for (int id : List.of(1, 42, 100, 199, 200)) {
             List<Row> viaIndex = reopenedExecutor.execute(Parser.parse("SELECT * FROM users WHERE id = " + id));
@@ -612,9 +628,9 @@ public class Main {
 
         reopenedDisk.close();
 
-        boolean ok = pointLookupsOk && missingOk && reopenLookupsOk;
+        boolean ok = pointLookupsOk && duplicateRejected && missingOk && reopenDuplicateRejected && reopenLookupsOk;
         System.out.println(ok
-                ? "STAGE 6B PASSED: index-accelerated point lookups agree with scans and survive reopen."
-                : "STAGE 6B FAILED: index/scan discrepancy or reopen rebuild failure.");
+                ? "STAGE 6B PASSED: index-accelerated point lookups agree with scans, duplicates rejected, and survives reopen."
+                : "STAGE 6B FAILED: index/scan discrepancy, duplicate not rejected, or reopen rebuild failure.");
     }
 }
