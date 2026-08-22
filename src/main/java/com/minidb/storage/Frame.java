@@ -6,18 +6,21 @@ package com.minidb.storage;
  * Tracks the page data along with:
  * - dirty: true if the page has been modified since it was loaded from disk
  * - pinCount: number of active readers/writers currently using the page (pinned pages cannot be evicted)
+ *
+ * Dirtiness is stored on the Page, not duplicated here: Page marks itself on every
+ * putInt/putBytes, so a caller that mutates a page but forgets to pass dirtied=true
+ * to unpin still gets its write flushed instead of silently losing it.
  */
 public class Frame {
     private final int pageNum;
     private final Page page;
-    private boolean dirty;
     private int pinCount;
 
     public Frame(int pageNum, Page page, boolean dirty, int pinCount) {
         this.pageNum = pageNum;
         this.page = page;
-        this.dirty = dirty;
         this.pinCount = pinCount;
+        setDirty(dirty);
     }
 
     public int getPageNum() {
@@ -29,11 +32,15 @@ public class Frame {
     }
 
     public boolean isDirty() {
-        return dirty;
+        return page.isDirty();
     }
 
     public void setDirty(boolean dirty) {
-        this.dirty = dirty;
+        if (dirty) {
+            page.markDirty();
+        } else {
+            page.clearDirty();
+        }
     }
 
     public int getPinCount() {

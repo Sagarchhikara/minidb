@@ -128,6 +128,15 @@ public class Table {
         bufferPool.flushAll();
     }
 
+    /**
+     * Flushes and then closes the underlying file. Closing the DiskManager directly
+     * drops every dirty page still sitting in the pool, so prefer this.
+     */
+    public void close() throws IOException {
+        flush();
+        bufferPool.getDisk().close();
+    }
+
     private void appendToNewPage(int id, byte[] bytes) throws IOException {
         int pageNum = bufferPool.getDisk().allocatePage();
         Page page = bufferPool.fetchPage(pageNum);
