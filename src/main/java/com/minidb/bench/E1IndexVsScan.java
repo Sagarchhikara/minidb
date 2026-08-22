@@ -32,9 +32,6 @@ public final class E1IndexVsScan {
     /** Constant across every n, deliberately. See the class comment. */
     private static final int POOL_FRAMES = 64;
 
-    /** Warm-pool batching; COLD forces batch=1 inside the harness. */
-    private static final int WARM_BATCH = 50;
-
     public static void main(String[] args) throws IOException {
         List<Result> results = new ArrayList<>();
 
@@ -50,8 +47,8 @@ public final class E1IndexVsScan {
         // "small n is slower".
         globalWarmup();
 
-        System.out.printf("%-9s %-6s %-6s %6s %8s %10s %10s %9s%n",
-                "n", "mode", "regime", "pool", "rows", "pages", "median us", "p95 us");
+        System.out.printf("%-9s %-6s %-6s %6s %6s %8s %7s %10s %10s %10s%n",
+                "n", "mode", "regime", "pool", "batch", "pages", "evict", "median us", "min us", "p95 us");
 
         for (int n : SCALES) {
             String path = DataGen.ensure(n);
@@ -70,11 +67,12 @@ public final class E1IndexVsScan {
                     // walk the heap. Same query, same rows, different access path.
                     String sql = "SELECT * FROM users WHERE id = " + (n / 2);
 
-                    Result r = Harness.run(table, n, sql, useIndexes, regime, WARM_BATCH);
+                    Result r = Harness.run(table, n, sql, useIndexes, regime);
                     results.add(r);
-                    System.out.printf("%-9d %-6s %-6s %6d %8d %10d %10.2f %9.2f%n",
-                            r.n(), r.mode(), r.regime(), r.poolFrames(), r.rowsReturned(),
-                            r.pagesRead(), r.medianMicros(), r.p95Micros());
+                    System.out.printf("%-9d %-6s %-6s %6d %6d %8d %7d %10.2f %10.2f %10.2f%n",
+                            r.n(), r.mode(), r.regime(), r.poolFrames(), r.batch(),
+                            r.pagesRead(), r.evictions(), r.medianMicros(), r.minMicros(),
+                            r.p95Micros());
 
                     table.close();
                 }
@@ -94,18 +92,19 @@ public final class E1IndexVsScan {
             disk.open(path);
             Table table = new Table(new BufferPool(disk, POOL_FRAMES), BPlusTree.DEFAULT_MAX_KEYS);
             Harness.run(table, SCALES[0], "SELECT * FROM users WHERE id = " + (SCALES[0] / 2),
-                    useIndexes, PoolRegime.WARM, WARM_BATCH);
+                    useIndexes, PoolRegime.WARM);
             table.close();
         }
     }
 
     private static void writeCsv(List<Result> results) throws IOException {
         try (PrintWriter out = new PrintWriter("e1_results.csv")) {
-            out.println("n,mode,regime,pool_frames,rows,pages_read,median_us,p95_us,parse_us");
+            out.println("n,mode,regime,pool_frames,rows,pages_read,evictions,batch,median_us,min_us,p95_us,gc_per_sample,parse_us");
             for (Result r : results) {
-                out.printf("%d,%s,%s,%d,%d,%d,%.3f,%.3f,%.3f%n",
+                out.printf("%d,%s,%s,%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.2f,%.3f%n",
                         r.n(), r.mode(), r.regime(), r.poolFrames(), r.rowsReturned(),
-                        r.pagesRead(), r.medianMicros(), r.p95Micros(), r.parseMicros());
+                        r.pagesRead(), r.evictions(), r.batch(), r.medianMicros(),
+                        r.minMicros(), r.p95Micros(), r.gcPerSample(), r.parseMicros());
             }
         }
     }

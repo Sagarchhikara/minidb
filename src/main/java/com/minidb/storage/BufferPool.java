@@ -20,6 +20,7 @@ public class BufferPool {
 
     private int hits = 0;
     private int misses = 0;
+    private int evictions = 0;
 
     public BufferPool(DiskManager disk, int capacity) {
         this(disk, capacity, new LruPolicy());
@@ -94,6 +95,7 @@ public class BufferPool {
         }
         table.remove(victimPage);
         policy.remove(victimPage);
+        evictions++;
     }
 
     /**
@@ -125,6 +127,10 @@ public class BufferPool {
 
     public synchronized int getMisses() {
         return misses;
+    }
+
+    public synchronized int getEvictions() {
+        return evictions;
     }
 
     public synchronized int getCapacity() {
@@ -167,6 +173,17 @@ public class BufferPool {
             policy.remove(pageNum);
         }
         table.clear();
+    }
+
+    /** Frames currently holding unflushed writes. */
+    public synchronized int dirtyFrameCount() {
+        int n = 0;
+        for (Frame f : table.values()) {
+            if (f.isDirty()) {
+                n++;
+            }
+        }
+        return n;
     }
 
     /** Zeroes the hit/miss counters without touching cached pages. */

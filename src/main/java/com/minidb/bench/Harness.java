@@ -12,6 +12,8 @@ import com.minidb.storage.BufferPool;
 import com.minidb.table.Table;
 
 import java.io.IOException;
+import java.lang.management.GarbageCollectorMXBean;
+import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -31,8 +33,29 @@ public final class Harness {
 
     /** Discarded iterations, to let JIT compile the hot path before anything is recorded. */
     public static final int WARMUP = 20;
-    /** Recorded measurements. Each yields one latency sample. */
-    public static final int MEASURE = 25;
+    /**
+     * Recorded measurements. Each yields one latency sample.
+     *
+     * Odd, so the median is an actual observation rather than an interpolation. 25 was
+     * too few once adaptive batching dropped slow queries to batch=1: a 10K scan cell
+     * then spanned only ~10ms total and the median sat 65% above the min. More samples
+     * cost little now that batching no longer inflates the slow cells.
+     */
+    public static final int MEASURE = 51;
+
+    /**
+     * Target duration of one timed region, in nanoseconds.
+     *
+     * Batching exists to lift a sample above timer resolution, but a fixed batch
+     * over-corrects at the slow end: at B=50 a 1M warm scan sample spans 1.4s and
+     * allocates ~50M Rows, so EVERY sample contains multiple GCs and the median loses
+     * its ability to reject them. Sizing each batch to land near this target gives
+     * ~300 for a sub-microsecond index seek and 1 for a 27ms scan, so GC-free samples
+     * exist for the median to find.
+     */
+    private static final long TARGET_BATCH_NANOS = 100_000L;
+
+    private static final int MAX_BATCH = 1000;
 
     /** Guards against dead-code elimination: every result row feeds this. */
     private static long sink;
@@ -58,25 +81,33 @@ public final class Harness {
             int poolFrames,
             int rowsReturned,
             int pagesRead,
+            int evictions,
+            int batch,
             double medianMicros,
             double p95Micros,
+            double minMicros,
+            double gcPerSample,
             double parseMicros) {
+    }
+
+    private static long gcCount() {
+        long c = 0;
+        for (GarbageCollectorMXBean b : ManagementFactory.getGarbageCollectorMXBeans()) {
+            c += b.getCollectionCount();
+        }
+        return c;
     }
 
     /**
      * Runs one (n, mode) cell.
      *
      * @param useIndexes false forces the SeqScan plan for the same query.
-     * @param batch      queries per timed region. Must be 1 for COLD, since the reset
-     *                   happens outside the timer and only the first query would be cold.
      */
     public static Result run(Table table, int n, String sql, boolean useIndexes,
-                             PoolRegime regime, int batch) throws IOException {
+                             PoolRegime regime) throws IOException {
         BufferPool pool = table.getBufferPool();
         SelectStatement stmt = (SelectStatement) Parser.parse(sql);
         Planner planner = new Planner(table).useIndexes(useIndexes);
-
-        int effectiveBatch = (regime == PoolRegime.COLD) ? 1 : batch;
 
         // ---- Guards, before the clock starts -------------------------------------
         // A silently unmatched rewrite rule makes both arms run SeqScan, the curves
@@ -107,9 +138,27 @@ public final class Harness {
             pool.clear();
         }
         pool.resetCounters();
+        int evictionsBefore = pool.getEvictions();
         int rows = Executor.drain(planner.plan(stmt)).size();
         int pagesRead = pool.getMisses();
+        // Reported because COLD is not purely cold: it starts from an empty pool and so
+        // gets `capacity` eviction-free insertions that WARM pays for. The asymmetry is
+        // largest when the table is barely bigger than the pool (84 pages vs 64 frames
+        // gives WARM 84 evictions and COLD 20) and vanishes as n grows. Without this
+        // column that shows up only as an unexplained latency inversion.
+        int evictions = pool.getEvictions() - evictionsBefore;
         pool.assertNoPinnedFrames();
+
+        // ---- Batch sizing ----------------------------------------------------------
+        // COLD is always 1: the reset sits outside the timer, so with B=50 only the
+        // first query of a batch is cold and the sample is a 1:49 blend. That blend
+        // does not fail loudly — at 1.2us cold and 0.3us warm it reports 0.318us, i.e.
+        // the WARM number to two significant figures, in a table that looks healthy.
+        // Asserted below rather than left to the expression staying correct.
+        int effectiveBatch = (regime == PoolRegime.COLD) ? 1 : calibrateBatch(planner, stmt);
+        if (regime == PoolRegime.COLD && effectiveBatch != 1) {
+            throw new IllegalStateException("COLD regime requires batch 1, got " + effectiveBatch);
+        }
 
         // ---- Warmup, discarded ----------------------------------------------------
         for (int i = 0; i < WARMUP; i++) {
@@ -121,11 +170,20 @@ public final class Harness {
             }
         }
 
+        // Data generation can leave frames dirty. The first clear() of a cell would flush
+        // them and every later one would not, so one sample would carry a write the rest
+        // do not. Warmup happens to absorb it; that is ordering luck, not a guarantee.
+        if (pool.dirtyFrameCount() != 0) {
+            throw new IllegalStateException("pool has " + pool.dirtyFrameCount()
+                    + " dirty frame(s) entering measurement; the first sample would pay a flush");
+        }
+
         // ---- Measurement ----------------------------------------------------------
         // Pool reset sits OUTSIDE the timed region: clear() walks and flushes frames,
         // which is harness cost, not query cost. Timing it would add a term that grows
         // with pool size and would be indistinguishable from query work in the result.
         List<Double> samples = new ArrayList<>(MEASURE);
+        long gcBefore = gcCount();
         for (int i = 0; i < MEASURE; i++) {
             if (regime == PoolRegime.COLD) {
                 pool.clear();
@@ -137,6 +195,7 @@ public final class Harness {
             long elapsed = System.nanoTime() - t0;
             samples.add(elapsed / 1000.0 / effectiveBatch);
         }
+        double gcPerSample = (gcCount() - gcBefore) / (double) MEASURE;
         pool.assertNoPinnedFrames();
 
         // ---- Parse cost, measured separately --------------------------------------
@@ -145,8 +204,36 @@ public final class Harness {
         double parseMicros = measureParse(sql, effectiveBatch);
 
         Collections.sort(samples);
+        // min is reported because it is the GC-free sample. When median and min disagree
+        // across two regimes that read identical pages, the difference is collector time,
+        // not engine behaviour.
         return new Result(n, useIndexes ? "index" : "scan", regime, pool.getCapacity(),
-                rows, pagesRead, percentile(samples, 0.50), percentile(samples, 0.95), parseMicros);
+                rows, pagesRead, evictions, effectiveBatch,
+                percentile(samples, 0.50), percentile(samples, 0.95), samples.get(0),
+                gcPerSample, parseMicros);
+    }
+
+    /**
+     * Picks a batch size so one timed region lands near TARGET_BATCH_NANOS.
+     *
+     * Times a few single queries first, then divides. Clamped to at least 1 so a query
+     * slower than the target is measured unbatched.
+     */
+    private static int calibrateBatch(Planner planner, SelectStatement stmt) throws IOException {
+        for (int i = 0; i < 5; i++) {
+            consume(Executor.drain(planner.plan(stmt)));
+        }
+        long best = Long.MAX_VALUE;
+        for (int i = 0; i < 5; i++) {
+            long t0 = System.nanoTime();
+            consume(Executor.drain(planner.plan(stmt)));
+            best = Math.min(best, System.nanoTime() - t0);
+        }
+        if (best <= 0) {
+            return MAX_BATCH;
+        }
+        long b = TARGET_BATCH_NANOS / best;
+        return (int) Math.max(1, Math.min(MAX_BATCH, b));
     }
 
     private static double measureParse(String sql, int batch) {
