@@ -143,6 +143,30 @@ public class BufferPool {
         return table.get(pageNum);
     }
 
+    /**
+     * Tripwire for pin leaks: throws if any frame is still pinned.
+     *
+     * Every fetchPage must be paired with exactly one unpin, so at a quiescent point
+     * (end of a query, end of a test) no frame should hold a pin. A leaked pin is
+     * silent until the pool fills up and evictOne finds nothing evictable, which
+     * surfaces the failure arbitrarily far from the operator that caused it.
+     */
+    public synchronized void assertNoPinnedFrames() {
+        StringBuilder leaked = new StringBuilder();
+        int count = 0;
+        for (Frame f : table.values()) {
+            if (f.getPinCount() > 0) {
+                if (count++ > 0) {
+                    leaked.append(", ");
+                }
+                leaked.append("page ").append(f.getPageNum()).append(" pinCount=").append(f.getPinCount());
+            }
+        }
+        if (count > 0) {
+            throw new IllegalStateException("Pin leak: " + count + " frame(s) still pinned -> " + leaked);
+        }
+    }
+
     public DiskManager getDisk() {
         return disk;
     }

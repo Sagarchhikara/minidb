@@ -16,7 +16,8 @@ public class Lexer {
             "INTO", TokenType.INTO,
             "VALUES", TokenType.VALUES,
             "FROM", TokenType.FROM,
-            "WHERE", TokenType.WHERE
+            "WHERE", TokenType.WHERE,
+            "LIMIT", TokenType.LIMIT
     );
 
     private Lexer() {
@@ -47,7 +48,10 @@ public class Lexer {
                 continue;
             }
 
-            if (Character.isDigit(c)) {
+            // '-' is only ever a sign here: the grammar has no arithmetic, so there is
+            // no binary minus for it to be confused with.
+            if (Character.isDigit(c) || (c == '-' && i + 1 < n && Character.isDigit(sql.charAt(i + 1)))) {
+                i++;
                 while (i < n && Character.isDigit(sql.charAt(i))) {
                     i++;
                 }
@@ -57,17 +61,28 @@ public class Lexer {
 
             if (c == '\'') {
                 i++;
-                int contentStart = i;
-                while (i < n && sql.charAt(i) != '\'') {
+                StringBuilder content = new StringBuilder();
+                boolean closed = false;
+                while (i < n) {
+                    if (sql.charAt(i) == '\'') {
+                        // SQL escapes a quote by doubling it: 'O''Brien' -> O'Brien.
+                        if (i + 1 < n && sql.charAt(i + 1) == '\'') {
+                            content.append('\'');
+                            i += 2;
+                            continue;
+                        }
+                        i++; // closing quote
+                        closed = true;
+                        break;
+                    }
+                    content.append(sql.charAt(i));
                     i++;
                 }
-                if (i >= n) {
+                if (!closed) {
                     throw new ParseException("unterminated string literal", start);
                 }
                 // Contents are never uppercased or otherwise normalized - 'Sagar' != 'sagar'.
-                String content = sql.substring(contentStart, i);
-                i++; // closing quote
-                tokens.add(new Token(TokenType.STRING, content, start));
+                tokens.add(new Token(TokenType.STRING, content.toString(), start));
                 continue;
             }
 

@@ -30,8 +30,25 @@ public class RowPage {
         return new RowPage(page);
     }
 
-    /** Wraps a page that already carries a header (e.g. one just read off disk). */
+    /**
+     * Wraps a page that already carries a header (e.g. one just read off disk).
+     *
+     * An all-zero header is not corruption: allocatePage() grows the file with zeros
+     * immediately, so a page allocated but never flushed reads back this way. Treat it
+     * as the empty page it is and stamp the header, rather than letting freeOffset 0
+     * send the next row on top of the header. Any other out-of-range header is real
+     * damage and is raised instead of being written through.
+     */
     public static RowPage load(Page page) {
+        int free = page.getInt(FREE_OFF);
+        int rows = page.getInt(NUM_ROWS_OFF);
+        if (free == 0 && rows == 0) {
+            return init(page);
+        }
+        if (free < HEADER_SIZE || free > Page.PAGE_SIZE || rows < 0) {
+            throw new IllegalStateException("Corrupt page header on page " + page.getPageNumber()
+                    + ": numRows=" + rows + ", freeOffset=" + free);
+        }
         return new RowPage(page);
     }
 
@@ -81,6 +98,38 @@ public class RowPage {
 
     public int getRowCount() {
         return numRows();
+    }
+
+    /**
+     * A lazy forward cursor over this page's rows.
+     *
+     * getAllRows() materializes the whole page, which defeats the point of a pipelined
+     * scan; this decodes one record at a time so SeqScan can hold the page pinned and
+     * yield rows on demand. Record widths vary, so the cursor carries the running
+     * offset rather than indexing.
+     */
+    public RowCursor cursor() {
+        return new RowCursor();
+    }
+
+    public final class RowCursor {
+        private int offset = HEADER_SIZE;
+        private int index = 0;
+
+        public boolean hasNext() {
+            return index < numRows();
+        }
+
+        public Row next() {
+            if (!hasNext()) {
+                throw new IllegalStateException("No more rows on page " + page.getPageNumber());
+            }
+            byte[] data = page.getData();
+            Row row = RowSerializer.deserialize(data, offset);
+            offset += RowSerializer.recordSize(data, offset);
+            index++;
+            return row;
+        }
     }
 
     /** The largest serialized row that could ever fit on a page, header included. */

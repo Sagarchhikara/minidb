@@ -2,6 +2,10 @@ package com.minidb;
 
 import com.minidb.index.BPlusTree;
 import com.minidb.index.Rid;
+import com.minidb.plan.IndexSeek;
+import com.minidb.plan.Operator;
+import com.minidb.plan.Planner;
+import com.minidb.plan.SeqScan;
 import com.minidb.record.Row;
 import com.minidb.record.RowPage;
 import com.minidb.record.RowSerializer;
@@ -48,6 +52,8 @@ public class Main {
         stage6BTreeTableIntegration();
         System.out.println();
         stage7BufferPool();
+        System.out.println();
+        stage8QueryPlanner();
     }
 
     // Stage 1: raw page data survives a close/reopen cycle.
@@ -267,8 +273,11 @@ public class Main {
         reloaded.flush();
         reopened.close();
 
+        // expectedAdults is asserted non-zero first: comparing two counts that could both
+        // be 0 would pass without the predicate ever having matched anything.
         boolean okDisk = sameRows(expected, afterReopen)
                 && pagesAfter == pages
+                && expectedAdults > 0
                 && adults.size() == expectedAdults;
 
         System.out.println(okDisk
@@ -693,6 +702,7 @@ public class Main {
         p0 = pool.fetchPage(0);
         pool.unpin(0, false);
 
+        pool.assertNoPinnedFrames();
         disk.close();
 
         boolean ok = (pool.getHits() == 1) && (pool.getMisses() == 5);
@@ -725,6 +735,7 @@ public class Main {
         }
 
         boolean evictedFromPool = !pool.isCached(0);
+        pool.assertNoPinnedFrames();
 
         // Close the pool without calling flushAll — disk file must ALREADY have page 0 flushed via eviction!
         disk.close();
@@ -754,6 +765,15 @@ public class Main {
             disk.allocatePage();
         }
 
+        // Give every page a distinguishable marker. Without this the test proves only
+        // WHICH page the policy dropped, not that the pages it kept still hold the right
+        // bytes — a policy that evicted correctly but corrupted survivors would pass.
+        for (int i = 0; i < 6; i++) {
+            Page marked = new Page(i);
+            marked.putInt(0, 7000 + i);
+            disk.writePage(marked);
+        }
+
         // Access sequence: 1, 2, 3, 1, 4 with capacity 3
         // LRU: touch on 1 moves 1 to MRU, so accessing 4 evicts 2 (least recently used)
         BufferPool lruPool = new BufferPool(disk, 3, new LruPolicy());
@@ -781,13 +801,32 @@ public class Main {
                 && fifoPool.isCached(3)
                 && fifoPool.isCached(4);
 
+        // Contents, not just residency: every surviving frame must still carry its marker,
+        // and the evicted page must re-read correctly from disk.
+        boolean contentsOk = markerOk(lruPool, 1) && markerOk(lruPool, 3) && markerOk(lruPool, 4)
+                && markerOk(lruPool, 2)   // evicted by LRU - must come back off disk intact
+                && markerOk(fifoPool, 2) && markerOk(fifoPool, 3) && markerOk(fifoPool, 4)
+                && markerOk(fifoPool, 1); // evicted by FIFO
+
+        lruPool.assertNoPinnedFrames();
+        fifoPool.assertNoPinnedFrames();
         disk.close();
 
-        boolean ok = lruOk && fifoOk;
+        boolean ok = lruOk && fifoOk && contentsOk;
         System.out.println(ok
-                ? "STAGE 7c PASSED: LRU evicted page 2 while FIFO evicted page 1 on pattern 1,2,3,1,4."
-                : "STAGE 7c FAILED: eviction policy divergence mismatch (lruOk=" + lruOk + ", fifoOk=" + fifoOk + ").");
+                ? "STAGE 7c PASSED: LRU evicted page 2 while FIFO evicted page 1 on pattern 1,2,3,1,4; all page contents intact."
+                : "STAGE 7c FAILED: lruOk=" + lruOk + " fifoOk=" + fifoOk + " contentsOk=" + contentsOk);
         return ok;
+    }
+
+    /** Fetches a page through the pool and checks it still carries its 7000+n marker. */
+    private static boolean markerOk(BufferPool pool, int pageNum) throws IOException {
+        Page p = pool.fetchPage(pageNum);
+        try {
+            return p.getInt(0) == 7000 + pageNum;
+        } finally {
+            pool.unpin(pageNum, false);
+        }
     }
 
     private static void poolAccess(BufferPool pool, int pageNum) throws IOException {
@@ -846,7 +885,9 @@ public class Main {
         Executor executor = new Executor(table);
 
         List<Row> expected = new ArrayList<>();
-        final int count = 150;
+        // 150 rows fit in a single page, so the pool would never actually evict; the row
+        // count has to span well past capacity for "constrained pool" to mean anything.
+        final int count = 2000;
         for (int id = 1; id <= count; id++) {
             String name = (id % 2 == 1) ? "Sagar" : "a-really-long-name-here";
             int age = 20 + (id % 50);
@@ -860,7 +901,7 @@ public class Main {
 
         // Point queries via index through buffer pool
         boolean indexLookupsOk = true;
-        for (int id : List.of(1, 25, 75, 120, 150)) {
+        for (int id : List.of(1, 25, 75, 120, 150, 999, 2000)) {
             List<Row> rows = executor.execute(Parser.parse("SELECT * FROM users WHERE id = " + id));
             if (rows.size() != 1 || rows.get(0).getId() != id) {
                 indexLookupsOk = false;
@@ -868,6 +909,9 @@ public class Main {
             }
         }
 
+        pool.assertNoPinnedFrames();
+        int pageCount = disk.getNumPages();
+        boolean evictionHappened = pageCount > pool.getCapacity();
         table.flush();
         disk.close();
 
@@ -880,12 +924,327 @@ public class Main {
         reopenedTable.flush();
         reopenedDisk.close();
 
+        reopenedPool.assertNoPinnedFrames();
         boolean reopenOk = sameRows(expected, afterReopen);
 
-        boolean ok = scanOk && indexLookupsOk && reopenOk;
+        boolean ok = scanOk && indexLookupsOk && reopenOk && evictionHappened;
         System.out.println(ok
-                ? "STAGE 7e PASSED: Table operates transparently through a constrained buffer pool."
-                : "STAGE 7e FAILED: table through buffer pool produced data mismatch.");
+                ? "STAGE 7e PASSED: Table survives a pool that evicted repeatedly ("
+                        + count + " rows over " + pageCount + " pages, capacity 3)."
+                : "STAGE 7e FAILED: scanOk=" + scanOk + " indexOk=" + indexLookupsOk
+                        + " reopenOk=" + reopenOk + " evictionHappened=" + evictionHappened);
         return ok;
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage 8: query planner (AST -> logical shape -> physical iterator tree)
+    // ---------------------------------------------------------------------
+
+    private static void stage8QueryPlanner() throws IOException {
+        boolean ok = true;
+        ok &= stage8aRegression();
+        ok &= stage8bDifferential();
+        ok &= stage8cPlanShape();
+        ok &= stage8dEarlyTermination();
+        ok &= stage8ePredicateSemantics();
+        System.out.println(ok
+                ? "STAGE 8 PASSED: planner produces correct answers, forced plans agree, and LIMIT terminates early."
+                : "STAGE 8 FAILED: see sub-step output above.");
+    }
+
+    /** Builds a table big enough to span many pages, so eviction and early exit are real. */
+    private static Table buildPlannerFixture(String dbPath, int rows, int poolCapacity) throws IOException {
+        new File(dbPath).delete();
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        Table table = new Table(new BufferPool(disk, poolCapacity));
+        for (int id = 1; id <= rows; id++) {
+            table.insert(new Row(id, "user-" + id + "-padding-to-widen-the-row", 20 + (id % 60)));
+        }
+        table.flush();
+        return table;
+    }
+
+    // (a) Regression: prior stage queries, now routed through the planner.
+    private static boolean stage8aRegression() throws IOException {
+        Table table = buildPlannerFixture("stage8_regression.db", 800, 64);
+        Executor executor = new Executor(table);
+
+        List<Row> all = executor.execute(Parser.parse("SELECT * FROM users"));
+        List<Row> byAge = executor.execute(Parser.parse("SELECT * FROM users WHERE age > 60"));
+        List<Row> byId = executor.execute(Parser.parse("SELECT * FROM users WHERE id = 500"));
+        List<Row> byName = executor.execute(Parser.parse("SELECT * FROM users WHERE name = 'nobody'"));
+        List<Row> missing = executor.execute(Parser.parse("SELECT * FROM users WHERE id = 99999"));
+
+        long expectedByAge = table.scan().stream().filter(r -> r.getAge() > 60).count();
+
+        boolean ok = all.size() == 800
+                && expectedByAge > 0          // precondition: the predicate must actually match
+                && byAge.size() == expectedByAge
+                && byId.size() == 1 && byId.get(0).getId() == 500
+                && byName.isEmpty()
+                && missing.isEmpty();
+
+        table.getBufferPool().assertNoPinnedFrames();
+        table.close();
+
+        System.out.println(ok
+                ? "STAGE 8a PASSED: all prior-stage queries return unchanged answers through the planner."
+                : "STAGE 8a FAILED: all=" + all.size() + " byAge=" + byAge.size() + "/" + expectedByAge
+                        + " byId=" + byId.size() + " byName=" + byName.size() + " missing=" + missing.size());
+        return ok;
+    }
+
+    // (b) Differential: useIndexes=true and useIndexes=false must agree, compared as sets.
+    private static boolean stage8bDifferential() throws IOException {
+        Table table = buildPlannerFixture("stage8_differential.db", 600, 16);
+        Executor executor = new Executor(table);
+
+        boolean ok = true;
+        StringBuilder detail = new StringBuilder();
+
+        // 600 rows exist, so ids 1..600 must return exactly one row and 4242 exactly none.
+        // Without asserting the expected size, two plans that both return empty would
+        // "agree" and the differential test would pass having compared nothing.
+        final int rowsInFixture = 600;
+        int nonEmptyComparisons = 0;
+
+        for (int id : List.of(1, 7, 250, 599, 600, 4242)) {
+            SelectStatement stmt = (SelectStatement) Parser.parse("SELECT * FROM users WHERE id = " + id);
+
+            List<Row> indexed = Executor.drain(executor.getPlanner().useIndexes(true).plan(stmt));
+            List<Row> scanned = Executor.drain(executor.getPlanner().useIndexes(false).plan(stmt));
+
+            // Oracle: the Stage 4 path, kept deliberately rather than deleted.
+            final int target = id;
+            List<Row> oracle = table.scanWhere(r -> r.getId() == target);
+
+            int expectedSize = (id >= 1 && id <= rowsInFixture) ? 1 : 0;
+            if (expectedSize > 0) {
+                nonEmptyComparisons++;
+            }
+
+            // Compared as sets: IndexSeek yields key order, SeqScan yields heap order.
+            boolean sizesOk = indexed.size() == expectedSize;
+            if (!sizesOk || !sameRowSet(indexed, scanned) || !sameRowSet(indexed, oracle)) {
+                ok = false;
+                detail.append(" id=").append(id)
+                        .append(" expected=").append(expectedSize)
+                        .append(" indexed=").append(indexed.size())
+                        .append(" scanned=").append(scanned.size())
+                        .append(" oracle=").append(oracle.size());
+            }
+            table.getBufferPool().assertNoPinnedFrames();
+        }
+
+        if (nonEmptyComparisons < 5) {
+            ok = false;
+            detail.append(" only ").append(nonEmptyComparisons).append(" non-empty comparisons");
+        }
+        executor.getPlanner().useIndexes(true);
+        table.close();
+
+        System.out.println(ok
+                ? "STAGE 8b PASSED: indexed and forced-scan plans return identical row sets, matching the scan oracle."
+                : "STAGE 8b FAILED: plan divergence ->" + detail);
+        return ok;
+    }
+
+    // (c) Plan shape: the rewrite rule fires exactly when it should.
+    private static boolean stage8cPlanShape() throws IOException {
+        Table table = buildPlannerFixture("stage8_shape.db", 200, 16);
+        Planner planner = new Planner(table);
+
+        Operator pointLookup = planner.useIndexes(true)
+                .plan((SelectStatement) Parser.parse("SELECT * FROM users WHERE id = 5"));
+        boolean seekOk = Planner.containsNode(pointLookup, IndexSeek.class)
+                && !Planner.containsNode(pointLookup, SeqScan.class);
+
+        Operator rangeQuery = planner.useIndexes(true)
+                .plan((SelectStatement) Parser.parse("SELECT * FROM users WHERE age > 60"));
+        boolean filterOk = Planner.containsNode(rangeQuery, com.minidb.plan.Filter.class)
+                && Planner.containsNode(rangeQuery, SeqScan.class)
+                && !Planner.containsNode(rangeQuery, IndexSeek.class);
+
+        // The forced-bad plan must really be a scan, or Stage 10's comparison is vacuous.
+        Operator forcedScan = planner.useIndexes(false)
+                .plan((SelectStatement) Parser.parse("SELECT * FROM users WHERE id = 5"));
+        boolean forcedOk = Planner.containsNode(forcedScan, SeqScan.class)
+                && !Planner.containsNode(forcedScan, IndexSeek.class);
+
+        boolean ok = seekOk && filterOk && forcedOk;
+        System.out.println(ok
+                ? "STAGE 8c PASSED: id = 5 plans to IndexSeek with no SeqScan; age > 60 plans to Filter over SeqScan."
+                : "STAGE 8c FAILED: seekOk=" + seekOk + " filterOk=" + filterOk + " forcedOk=" + forcedOk);
+        if (ok) {
+            System.out.print(Planner.explain(rangeQuery));
+        }
+        table.close();
+        return ok;
+    }
+
+    // (d) Early termination: LIMIT 3 must read far fewer pages than a full scan.
+    private static boolean stage8dEarlyTermination() throws IOException {
+        Table table = buildPlannerFixture("stage8_limit.db", 1500, 4);
+        BufferPool pool = table.getBufferPool();
+        Executor executor = new Executor(table);
+
+        int totalPages = pool.getDisk().getNumPages();
+        int limitedMisses;
+        int fullMisses;
+        boolean rowsOk;
+        boolean earlyOk;
+        boolean noLeak = true;
+
+        try {
+            int before = pool.getMisses();
+            List<Row> limited = executor.execute(Parser.parse("SELECT * FROM users LIMIT 3"));
+            limitedMisses = pool.getMisses() - before;
+            // The tripwire: LIMIT abandons SeqScan mid-page, so this is exactly where a
+            // missing unpin in close() shows up.
+            pool.assertNoPinnedFrames();
+
+            before = pool.getMisses();
+            List<Row> full = executor.execute(Parser.parse("SELECT * FROM users"));
+            fullMisses = pool.getMisses() - before;
+            pool.assertNoPinnedFrames();
+
+            rowsOk = limited.size() == 3 && full.size() == 1500;
+            // Exact, not "fewer": 3 rows all live on page 0, so a correctly pipelined
+            // scan reads exactly one page. "< fullMisses" would still pass if LIMIT
+            // leaked into reading half the table.
+            earlyOk = limitedMisses == 1 && fullMisses > 1;
+        } catch (IllegalStateException e) {
+            System.out.println("STAGE 8d FAILED: " + e.getMessage());
+            table.close();
+            return false;
+        }
+
+        // The emergent symptom of a pin leak is eviction starvation, but it only appears
+        // once `capacity` DISTINCT pages are stuck. Repeated LIMIT queries all abandon
+        // page 0, so they pile pins onto one frame and never starve the pool — which is
+        // exactly why assertNoPinnedFrames above is the real detector, not this. Land
+        // scans on different pages so the starvation path is genuinely exercised.
+        boolean evictionOk;
+        try {
+            for (int k = 0; k < pool.getCapacity(); k++) {
+                SeqScan scan = new SeqScan(pool);
+                scan.open();
+                for (int r = 0; r <= k * 95; r++) {
+                    scan.next();
+                }
+                scan.close();
+            }
+            pool.assertNoPinnedFrames();
+            List<Row> sweep = executor.execute(Parser.parse("SELECT * FROM users WHERE age > 70"));
+            evictionOk = !sweep.isEmpty();
+            pool.assertNoPinnedFrames();
+        } catch (IllegalStateException e) {
+            evictionOk = false;
+            System.out.println("  staggered scans starved the pool: " + e.getMessage());
+        }
+
+        boolean ok = rowsOk && earlyOk && evictionOk;
+        System.out.println(ok
+                ? "STAGE 8d PASSED: LIMIT 3 touched " + limitedMisses + " page(s) vs " + fullMisses
+                        + " for a full scan of " + totalPages + "; no frames left pinned."
+                : "STAGE 8d FAILED: rowsOk=" + rowsOk + " earlyOk=" + earlyOk + " (limit="
+                        + limitedMisses + " full=" + fullMisses + ") evictionOk=" + evictionOk);
+        table.close();
+        return ok;
+    }
+
+    /**
+     * (e) Predicate semantics, asserted directly.
+     *
+     * Planner and oracle share Predicates, which is right for 8b (that test is about
+     * access path, and both plans run the same Filter) but it means predicate meaning
+     * is outside differential coverage: a wrong operator would agree with itself. These
+     * assertions pin the semantics down directly instead.
+     */
+    private static boolean stage8ePredicateSemantics() throws IOException {
+        String dbPath = "stage8_predicates.db";
+        new File(dbPath).delete();
+        DiskManager disk = new DiskManager();
+        disk.open(dbPath);
+        Table table = new Table(disk);
+
+        // Ages chosen to sit exactly on the boundary: 59, 60, 61.
+        table.insert(new Row(1, "Sagar", 59));
+        table.insert(new Row(2, "Ada", 60));
+        table.insert(new Row(3, "Grace", 61));
+        table.flush();
+        Executor executor = new Executor(table);
+
+        // Strict > must exclude the boundary value itself; >= must include it.
+        List<Row> gt = executor.execute(Parser.parse("SELECT * FROM users WHERE age > 60"));
+        List<Row> gte = executor.execute(Parser.parse("SELECT * FROM users WHERE age >= 60"));
+        List<Row> lt = executor.execute(Parser.parse("SELECT * FROM users WHERE age < 60"));
+        List<Row> lte = executor.execute(Parser.parse("SELECT * FROM users WHERE age <= 60"));
+        boolean boundaryOk = gt.size() == 1 && gt.get(0).getAge() == 61
+                && gte.size() == 2
+                && lt.size() == 1 && lt.get(0).getAge() == 59
+                && lte.size() == 2;
+
+        // != on both a numeric and a text column.
+        List<Row> neqInt = executor.execute(Parser.parse("SELECT * FROM users WHERE age != 60"));
+        List<Row> neqStr = executor.execute(Parser.parse("SELECT * FROM users WHERE name != 'Ada'"));
+        List<Row> eqStr = executor.execute(Parser.parse("SELECT * FROM users WHERE name = 'Ada'"));
+        boolean neqOk = neqInt.size() == 2 && neqStr.size() == 2
+                && eqStr.size() == 1 && eqStr.get(0).getName().equals("Ada");
+
+        // Ordering comparisons are not defined for a text column.
+        boolean stringOrderRejected = rejects(executor, "SELECT * FROM users WHERE name > 'Ada'")
+                && rejects(executor, "SELECT * FROM users WHERE name < 'Ada'")
+                && rejects(executor, "SELECT * FROM users WHERE name >= 'Ada'");
+
+        // Cross-type comparisons must throw rather than coerce.
+        boolean typeMismatchRejected = rejects(executor, "SELECT * FROM users WHERE age > 'Sagar'")
+                && rejects(executor, "SELECT * FROM users WHERE name = 42")
+                && rejects(executor, "SELECT * FROM users WHERE id = 'Sagar'");
+
+        // Unknown columns are rejected, not silently treated as no-match.
+        boolean unknownColumnRejected = rejects(executor, "SELECT * FROM users WHERE nosuch = 1");
+
+        table.getBufferPool().assertNoPinnedFrames();
+        table.close();
+
+        boolean ok = boundaryOk && neqOk && stringOrderRejected && typeMismatchRejected && unknownColumnRejected;
+        System.out.println(ok
+                ? "STAGE 8e PASSED: boundary/!=/type-mismatch predicate semantics pinned down directly."
+                : "STAGE 8e FAILED: boundary=" + boundaryOk + " neq=" + neqOk
+                        + " stringOrder=" + stringOrderRejected + " typeMismatch=" + typeMismatchRejected
+                        + " unknownColumn=" + unknownColumnRejected);
+        return ok;
+    }
+
+    /** True if executing the SQL throws IllegalArgumentException rather than returning rows. */
+    private static boolean rejects(Executor executor, String sql) {
+        try {
+            executor.execute(Parser.parse(sql));
+            return false;
+        } catch (IllegalArgumentException e) {
+            return true;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /** Order-insensitive row comparison — IndexSeek and SeqScan return different orders. */
+    private static boolean sameRowSet(List<Row> a, List<Row> b) {
+        if (a.size() != b.size()) {
+            return false;
+        }
+        List<String> left = new ArrayList<>();
+        List<String> right = new ArrayList<>();
+        for (Row r : a) {
+            left.add(r.toString());
+        }
+        for (Row r : b) {
+            right.add(r.toString());
+        }
+        Collections.sort(left);
+        Collections.sort(right);
+        return left.equals(right);
     }
 }

@@ -2,7 +2,7 @@ package com.minidb.sql;
 
 public enum TokenType {
     // keywords
-    SELECT, INSERT, INTO, VALUES, FROM, WHERE,
+    SELECT, INSERT, INTO, VALUES, FROM, WHERE, LIMIT,
     // literals & names
     IDENTIFIER, NUMBER, STRING,
     // punctuation / operators

@@ -1,31 +1,36 @@
 package com.minidb.sql;
 
-import com.minidb.index.Rid;
+import com.minidb.plan.Operator;
+import com.minidb.plan.Planner;
 import com.minidb.record.Row;
-import com.minidb.record.RowSerializer;
-import com.minidb.storage.Page;
 import com.minidb.table.Table;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.function.Function;
-import java.util.function.Predicate;
-import java.util.function.ToIntFunction;
 
 /**
- * Thin tree-walk from AST to the Table calls Stage 4 already proved. Not a
- * planner - a switch on statement type that reuses insert/scan/scanWhere
- * directly, with an index-accelerated fast path for WHERE id = X. The schema
- * (id, name, age) is hardcoded here the same way it is in Row; there is nowhere
- * else to put it until there is a catalog.
+ * AST -> plan -> rows.
+ *
+ * As of Stage 8 this holds no query strategy of its own: the hardcoded
+ * "if (WHERE id = X) use the index else scan" reflex moved into Planner, where the
+ * choice is an object that can be inspected, forced, and benchmarked. What is left
+ * here is statement dispatch and draining the iterator tree.
  */
 public class Executor {
+
     private static final String TABLE_NAME = "users";
 
     private final Table table;
+    private final Planner planner;
 
     public Executor(Table table) {
         this.table = table;
+        this.planner = new Planner(table);
+    }
+
+    public Planner getPlanner() {
+        return planner;
     }
 
     public List<Row> execute(Statement stmt) throws IOException {
@@ -36,25 +41,30 @@ public class Executor {
         }
         if (stmt instanceof SelectStatement sel) {
             checkTable(sel.table());
-            if (sel.where() != null
-                    && sel.where().column().equalsIgnoreCase("id")
-                    && sel.where().op() == TokenType.EQ
-                    && sel.where().literal() instanceof Integer targetId) {
-                Rid rid = table.getIndex().search(targetId);
-                if (rid == null) {
-                    return List.of();
-                }
-                Page page = table.getBufferPool().fetchPage(rid.pageNum());
-                try {
-                    Row row = RowSerializer.deserialize(page.getData(), rid.offset());
-                    return List.of(row);
-                } finally {
-                    table.getBufferPool().unpin(rid.pageNum(), false);
-                }
-            }
-            return sel.where() == null ? table.scan() : table.scanWhere(predicateFrom(sel.where()));
+            return drain(planner.plan(sel));
         }
         throw new IllegalStateException("unhandled statement type: " + stmt);
+    }
+
+    /** Runs a plan to completion. close() in a finally, so an exception mid-scan still unpins. */
+    public static List<Row> drain(Operator plan) throws IOException {
+        List<Row> rows = new ArrayList<>();
+        plan.open();
+        try {
+            Row row;
+            while ((row = plan.next()) != null) {
+                rows.add(row);
+            }
+        } finally {
+            plan.close();
+        }
+        return rows;
+    }
+
+    /** Returns the plan EXPLAIN text for a SELECT, without running it. */
+    public String explain(SelectStatement sel) {
+        checkTable(sel.table());
+        return Planner.explain(planner.plan(sel));
     }
 
     /** Formats a row for display, projecting down to the requested columns. */
@@ -92,53 +102,6 @@ public class Executor {
             throw new IllegalArgumentException("age must be a number, got " + values.get(2));
         }
         return new Row(id, name, age);
-    }
-
-    private Predicate<Row> predicateFrom(Condition condition) {
-        String column = condition.column().toLowerCase();
-        return switch (column) {
-            case "id" -> intPredicate(Row::getId, condition.op(), requireInt(condition));
-            case "age" -> intPredicate(Row::getAge, condition.op(), requireInt(condition));
-            case "name" -> stringPredicate(Row::getName, condition.op(), requireString(condition));
-            default -> throw new IllegalArgumentException("unknown column '" + condition.column() + "'");
-        };
-    }
-
-    private static int requireInt(Condition condition) {
-        if (condition.literal() instanceof Integer n) {
-            return n;
-        }
-        throw new IllegalArgumentException(
-                "column '" + condition.column() + "' compares to a number, got " + condition.literal());
-    }
-
-    private static String requireString(Condition condition) {
-        if (condition.literal() instanceof String s) {
-            return s;
-        }
-        throw new IllegalArgumentException(
-                "column '" + condition.column() + "' compares to a string, got " + condition.literal());
-    }
-
-    private static Predicate<Row> intPredicate(ToIntFunction<Row> field, TokenType op, int value) {
-        return switch (op) {
-            case EQ -> r -> field.applyAsInt(r) == value;
-            case NEQ -> r -> field.applyAsInt(r) != value;
-            case LT -> r -> field.applyAsInt(r) < value;
-            case GT -> r -> field.applyAsInt(r) > value;
-            case LTE -> r -> field.applyAsInt(r) <= value;
-            case GTE -> r -> field.applyAsInt(r) >= value;
-            default -> throw new IllegalArgumentException("operator " + op + " is not valid for a numeric column");
-        };
-    }
-
-    private static Predicate<Row> stringPredicate(Function<Row, String> field, TokenType op, String value) {
-        return switch (op) {
-            case EQ -> r -> field.apply(r).equals(value);
-            case NEQ -> r -> !field.apply(r).equals(value);
-            default -> throw new IllegalArgumentException(
-                    "operator " + op + " is not valid for a text column (only = and != are)");
-        };
     }
 
     private static Object fieldValue(Row row, String column) {

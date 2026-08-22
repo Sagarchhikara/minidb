@@ -88,7 +88,20 @@ public class Parser {
             where = parseCondition();
         }
 
-        return new SelectStatement(table, columns, where);
+        Integer limit = null;
+        if (peek().type() == TokenType.LIMIT) {
+            Token limitToken = advance();
+            Object n = parseLiteral();
+            if (!(n instanceof Integer count)) {
+                throw new ParseException("LIMIT expects a number but got '" + n + "'", limitToken.pos());
+            }
+            if (count < 0) {
+                throw new ParseException("LIMIT must not be negative but got " + count, limitToken.pos());
+            }
+            limit = count;
+        }
+
+        return new SelectStatement(table, columns, where, limit);
     }
 
     private Condition parseCondition() {
@@ -110,7 +123,11 @@ public class Parser {
         Token t = peek();
         if (t.type() == TokenType.NUMBER) {
             advance();
-            return Integer.parseInt(t.text());
+            try {
+                return Integer.parseInt(t.text());
+            } catch (NumberFormatException e) {
+                throw new ParseException("number '" + t.text() + "' does not fit in a 32-bit int", t.pos());
+            }
         }
         if (t.type() == TokenType.STRING) {
             advance();

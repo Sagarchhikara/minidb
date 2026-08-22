@@ -212,6 +212,26 @@ public class BPlusTree {
     }
 
     /**
+     * Root-to-leaf depth, counting the leaf. 0 for an empty tree.
+     *
+     * Cheap (one descent) unlike validate(), which also returns the height but walks
+     * every node — cost estimation must not pay for a full validation.
+     */
+    public int height() {
+        int h = 0;
+        Node curr = root;
+        while (curr != null) {
+            h++;
+            if (curr instanceof Internal n) {
+                curr = n.children.get(0);
+            } else {
+                break;
+            }
+        }
+        return h;
+    }
+
+    /**
      * Returns the leftmost leaf of the B+Tree.
      */
     public Leaf getLeftmostLeaf() {
