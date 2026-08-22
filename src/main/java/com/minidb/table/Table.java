@@ -32,8 +32,13 @@ public class Table {
     }
 
     public Table(BufferPool bufferPool) throws IOException {
+        this(bufferPool, BPlusTree.DEFAULT_MAX_KEYS);
+    }
+
+    /** Explicit index fanout, so the benchmark can sweep it. */
+    public Table(BufferPool bufferPool, int maxKeys) throws IOException {
         this.bufferPool = bufferPool;
-        this.index = new BPlusTree();
+        this.index = new BPlusTree(maxKeys);
         rebuildIndex();
     }
 

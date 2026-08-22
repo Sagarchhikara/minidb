@@ -16,7 +16,17 @@ import java.util.List;
  * 6. Internal split: push-up (the middle key moves up and is excluded from both halves).
  */
 public class BPlusTree {
-    public static final int DEFAULT_MAX_KEYS = 3;
+    /**
+     * Fanout for a tree built without an explicit order.
+     *
+     * Stage 6 used 3 to force splits at every level during testing. That is a terrible
+     * benchmarking fanout: at 1M keys it gives a height near 13 with a tiny Java object
+     * per node, so a lookup is 13 pointer-chases with no locality and the measurement
+     * understates the index badly. Real B+Trees run fanouts in the hundreds.
+     *
+     * Tests that specifically want frequent splits still pass 3 explicitly.
+     */
+    public static final int DEFAULT_MAX_KEYS = 128;
 
     private final int maxKeys;
     private Node root;

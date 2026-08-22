@@ -144,6 +144,38 @@ public class BufferPool {
     }
 
     /**
+     * Drops every cached frame, flushing dirty ones first, and resets the policy.
+     *
+     * This is the cold-pool reset for benchmarking. Recreating the BufferPool would be
+     * the obvious way to go cold, but a Table owns its pool and rebuilding the Table
+     * re-scans the heap to rebuild the index — that cost would dominate every timed
+     * query and is a separate experiment. This drops cache state and nothing else.
+     *
+     * Throws if any frame is pinned: a pinned frame here means a leaked pin, and
+     * silently skipping it would leave the pool partially warm and quietly corrupt
+     * the measurement.
+     */
+    public synchronized void clear() throws IOException {
+        assertNoPinnedFrames();
+        for (Frame f : table.values()) {
+            if (f.isDirty()) {
+                disk.writePage(f.getPage());
+                f.setDirty(false);
+            }
+        }
+        for (Integer pageNum : table.keySet()) {
+            policy.remove(pageNum);
+        }
+        table.clear();
+    }
+
+    /** Zeroes the hit/miss counters without touching cached pages. */
+    public synchronized void resetCounters() {
+        hits = 0;
+        misses = 0;
+    }
+
+    /**
      * Tripwire for pin leaks: throws if any frame is still pinned.
      *
      * Every fetchPage must be paired with exactly one unpin, so at a quiescent point

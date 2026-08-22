@@ -519,53 +519,99 @@ public class Main {
         return ok;
     }
 
+    /**
+     * Randomized insert stress, swept across fanouts.
+     *
+     * Stage 6 ran this at maxKeys=3 only. Split logic is fanout-agnostic in principle,
+     * but Stage 10 benchmarks at 128 and sweeps the order as an experiment, so that
+     * "in principle" has to become a measured fact before any number is trusted.
+     * Both split paths are exercised at every fanout: leaves split by copy-up, internals
+     * by push-up, and validate() runs after every single insert.
+     */
     private static boolean stage6aRandomizedStressTest() {
-        final int n = 500;
-        final int maxKeys = 3; // small order forces splits at every level
-        BPlusTree tree = new BPlusTree(maxKeys);
+        final int n = 1000;
+        final int[] fanouts = {3, 4, 8, 32, 128, 256};
 
-        List<Integer> keys = new ArrayList<>();
-        for (int i = 1; i <= n; i++) {
-            keys.add(i);
-        }
-        Collections.shuffle(keys, new Random(42));
+        boolean ok = true;
+        int previousHeight = Integer.MAX_VALUE;
+        StringBuilder heights = new StringBuilder();
 
-        // Insert and validate after EVERY insert
-        for (int k : keys) {
-            tree.insert(k, new Rid(k / 10, k % 10));
-            tree.validate();
-        }
+        for (int maxKeys : fanouts) {
+            BPlusTree tree = new BPlusTree(maxKeys);
 
-        // Verify search for all inserted keys
-        boolean allFound = true;
-        for (int k = 1; k <= n; k++) {
-            Rid rid = tree.search(k);
-            if (rid == null || !rid.equals(new Rid(k / 10, k % 10))) {
-                allFound = false;
-                break;
+            List<Integer> keys = new ArrayList<>();
+            for (int i = 1; i <= n; i++) {
+                keys.add(i);
+            }
+            Collections.shuffle(keys, new Random(42));
+
+            // validate() after EVERY insert, at every fanout.
+            for (int k : keys) {
+                tree.insert(k, new Rid(k / 10, k % 10));
+                tree.validate();
+            }
+
+            boolean allFound = true;
+            for (int k = 1; k <= n; k++) {
+                Rid rid = tree.search(k);
+                if (rid == null || !rid.equals(new Rid(k / 10, k % 10))) {
+                    allFound = false;
+                    break;
+                }
+            }
+
+            boolean missingOk = (tree.search(0) == null)
+                    && (tree.search(n + 1) == null)
+                    && (tree.search(-5) == null);
+
+            List<Integer> sortedExpected = new ArrayList<>();
+            for (int i = 1; i <= n; i++) {
+                sortedExpected.add(i);
+            }
+            boolean chainOk = tree.getAllKeysFromLeafChain().equals(sortedExpected);
+
+            int height = tree.validate();
+            // The tree must be tall enough to have split at all (otherwise this fanout
+            // never exercised the split paths) and no taller than a balanced tree can be.
+            boolean splitHappened = height > 1;
+            // Bound from MINIMUM occupancy, not maximum: splits leave nodes half full, so
+            // a tree of n keys can be taller than the fully-packed ideal. minChildren is
+            // the fewest children an internal node can have after a split.
+            int minChildren = (maxKeys + 2) / 2;
+            boolean heightSane = height <= ceilLog(n, minChildren) + 1;
+            // Raising fanout must not make the tree taller.
+            boolean monotonic = height <= previousHeight;
+            previousHeight = height;
+
+            heights.append(" order=").append(maxKeys).append("->h").append(height);
+
+            boolean fanoutOk = allFound && missingOk && chainOk
+                    && splitHappened && heightSane && monotonic;
+            if (!fanoutOk) {
+                ok = false;
+                System.out.println("  fanout " + maxKeys + " FAILED: found=" + allFound
+                        + " missing=" + missingOk + " chain=" + chainOk
+                        + " split=" + splitHappened + " heightSane=" + heightSane
+                        + " monotonic=" + monotonic + " (height=" + height + ")");
             }
         }
 
-        // Verify missing keys
-        boolean missingOk = (tree.search(0) == null) && (tree.search(n + 1) == null) && (tree.search(-5) == null);
-
-        // Verify leaf-chain traversal equals sorted 1..n
-        List<Integer> chainKeys = tree.getAllKeysFromLeafChain();
-        List<Integer> sortedExpected = new ArrayList<>();
-        for (int i = 1; i <= n; i++) {
-            sortedExpected.add(i);
-        }
-        boolean chainOk = chainKeys.equals(sortedExpected);
-
-        int height = tree.validate();
-        boolean heightOk = height > 1 && height < 15; // balanced tree
-
-        System.out.println("Inserted " + n + " shuffled keys into tree (order " + maxKeys + "). Tree height: " + height);
-        boolean ok = allFound && missingOk && chainOk && heightOk;
+        System.out.println("Inserted " + n + " shuffled keys at each fanout." + heights);
         System.out.println(ok
-                ? "STAGE 6a.2 PASSED: 500-key stress test with invariant validation after every insert."
+                ? "STAGE 6a.2 PASSED: invariants hold after every insert across fanouts 3..256."
                 : "STAGE 6a.2 FAILED: stress test invariant violation or key mismatch.");
         return ok;
+    }
+
+    /** Smallest h with base^h >= n. */
+    private static int ceilLog(int n, int base) {
+        int h = 1;
+        long capacity = base;
+        while (capacity < n) {
+            capacity *= base;
+            h++;
+        }
+        return h;
     }
 
     // Stage 6B: wiring B+Tree into Table, RowPage, and Executor.
